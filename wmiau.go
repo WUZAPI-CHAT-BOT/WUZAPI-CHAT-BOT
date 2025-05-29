@@ -447,8 +447,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			img := evt.Message.GetImageMessage()
 			if img != nil {
 				// Create a temporary directory in /tmp
-				tmpDirectory := filepath.Join("/tmp", "user_"+txtid)
-				errDir := os.MkdirAll(tmpDirectory, 0751)
+				tmpDir := os.Getenv("TMPDIR")
+if tmpDir == "" {
+    tmpDir = "/data/data/com.termux/files/usr/tmp"
+}
+tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
+				errDir := os.MkdirAll(tmpDirectory, 0777)
 				if errDir != nil {
 					log.Error().Err(errDir).Msg("Could not create temporary directory")
 					return
@@ -466,7 +470,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				tmpPath := filepath.Join(tmpDirectory, evt.Info.ID+exts[0])
 
 				// Write the image to the temporary file
-				err = os.WriteFile(tmpPath, data, 0600)
+				err = os.WriteFile(tmpPath, data, 0777)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to save image to temporary file")
 					return
@@ -541,8 +545,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			audio := evt.Message.GetAudioMessage()
 			if audio != nil {
 				// Create a temporary directory in /tmp
-				tmpDirectory := filepath.Join("/tmp", "user_"+txtid)
-				errDir := os.MkdirAll(tmpDirectory, 0751)
+				tmpDir := os.Getenv("TMPDIR")
+if tmpDir == "" {
+    tmpDir = "/data/data/com.termux/files/usr/tmp"
+}
+tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
+				errDir := os.MkdirAll(tmpDirectory, 0777)
 				if errDir != nil {
 					log.Error().Err(errDir).Msg("Could not create temporary directory")
 					return
@@ -566,7 +574,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				tmpPath := filepath.Join(tmpDirectory, evt.Info.ID+ext)
 
 				// Write the audio to the temporary file
-				err = os.WriteFile(tmpPath, data, 0600)
+				err = os.WriteFile(tmpPath, data, 0777)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to save audio to temporary file")
 					return
@@ -641,8 +649,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			document := evt.Message.GetDocumentMessage()
 			if document != nil {
 				// Create a temporary directory in /tmp
-				tmpDirectory := filepath.Join("/tmp", "user_"+txtid)
-				errDir := os.MkdirAll(tmpDirectory, 0751)
+				tmpDir := os.Getenv("TMPDIR")
+if tmpDir == "" {
+    tmpDir = "/data/data/com.termux/files/usr/tmp"
+}
+tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
+				errDir := os.MkdirAll(tmpDirectory, 0777)
 				if errDir != nil {
 					log.Error().Err(errDir).Msg("Could not create temporary directory")
 					return
@@ -671,7 +683,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				tmpPath := filepath.Join(tmpDirectory, evt.Info.ID+extension)
 
 				// Write the document to the temporary file
-				err = os.WriteFile(tmpPath, data, 0600)
+				err = os.WriteFile(tmpPath, data, 0777)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to save document to temporary file")
 					return
@@ -742,101 +754,117 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				}
 			}
 
-			// try to get Video if any
-			video := evt.Message.GetVideoMessage()
-			if video != nil {
-				// Create a temporary directory in /tmp
-				tmpDirectory := filepath.Join("/tmp", "user_"+txtid)
-				errDir := os.MkdirAll(tmpDirectory, 0751)
-				if errDir != nil {
-					log.Error().Err(errDir).Msg("Could not create temporary directory")
-					return
-				}
+		// try to get Video if any
+video := evt.Message.GetVideoMessage()
+if video != nil {
+    // Create a temporary directory in $TMPDIR
+    tmpDir := os.Getenv("TMPDIR")
+    if tmpDir == "" {
+        tmpDir = "/data/data/com.termux/files/usr/tmp"
+    }
+    tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
+    log.Info().Str("tmpDirectory", tmpDirectory).Msg("Attempting to create temporary directory for video")
+    errDir := os.MkdirAll(tmpDirectory, 0777)
+    if errDir != nil {
+        log.Error().Err(errDir).Msg("Could not create temporary directory")
+        return
+    }
 
-				// Download the video
-				data, err := mycli.WAClient.Download(context.Background(), video)
-				if err != nil {
-					log.Error().Err(err).Msg("Failed to download video")
-					return
-				}
+    // Download the video
+    log.Info().Str("mimeType", video.GetMimetype()).Msg("Attempting to download video")
+    data, err := mycli.WAClient.Download(context.Background(), video)
+    if err != nil {
+        log.Error().Err(err).Str("mimeType", video.GetMimetype()).Msg("Failed to download video")
+        return
+    }
+    log.Info().Int("sizeBytes", len(data)).Msg("Video downloaded successfully")
 
-				// Determine the file extension based on the MIME type
-				exts, _ := mime.ExtensionsByType(video.GetMimetype())
-				tmpPath := filepath.Join(tmpDirectory, evt.Info.ID+exts[0])
+    // Determine the file extension based on the MIME type
+    exts, _ := mime.ExtensionsByType(video.GetMimetype())
+    var ext string
+    if len(exts) > 0 {
+        ext = exts[0]
+    } else {
+        ext = ".mp4" // Default extension for videos
+        log.Warn().Str("mimeType", video.GetMimetype()).Msg("No extension found for MIME type, using .mp4")
+    }
+    tmpPath := filepath.Join(tmpDirectory, evt.Info.ID+ext)
+    log.Info().Str("tmpPath", tmpPath).Msg("Video file path determined")
 
-				// Write the video to the temporary file
-				err = os.WriteFile(tmpPath, data, 0600)
-				if err != nil {
-					log.Error().Err(err).Msg("Failed to save video to temporary file")
-					return
-				}
+    // Write the video to the temporary file
+    err = os.WriteFile(tmpPath, data, 0777)
+    if err != nil {
+        log.Error().Err(err).Str("tmpPath", tmpPath).Msg("Failed to save video to temporary file")
+        return
+    }
+    log.Info().Str("tmpPath", tmpPath).Msg("Video saved to temporary file")
 
-				// Check if S3 is enabled for this user
-				var s3Config struct {
-					Enabled       bool   `db:"s3_enabled"`
-					MediaDelivery string `db:"media_delivery"`
-				}
-				err = mycli.db.Get(&s3Config, "SELECT s3_enabled, media_delivery FROM users WHERE id = $1", txtid)
-				if err != nil {
-					log.Error().Err(err).Msg("Failed to get S3 config")
-					s3Config.Enabled = false
-					s3Config.MediaDelivery = "base64"
-				}
+    // Check if S3 is enabled for this user
+    var s3Config struct {
+        Enabled       bool   `db:"s3_enabled"`
+        MediaDelivery string `db:"media_delivery"`
+    }
+    err = mycli.db.Get(&s3Config, "SELECT s3_enabled, media_delivery FROM users WHERE id = $1", txtid)
+    if err != nil {
+        log.Error().Err(err).Msg("Failed to get S3 config")
+        s3Config.Enabled = false
+        s3Config.MediaDelivery = "base64"
+    }
 
-				// Process S3 upload if enabled
-				if s3Config.Enabled && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
-					// Get sender JID for inbox/outbox determination
-					isIncoming := evt.Info.IsFromMe == false
-					contactJID := evt.Info.Sender.String()
-					if evt.Info.IsGroup {
-						contactJID = evt.Info.Chat.String()
-					}
+    // Process S3 upload if enabled
+    if s3Config.Enabled && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
+        isIncoming := evt.Info.IsFromMe == false
+        contactJID := evt.Info.Sender.String()
+        if evt.Info.IsGroup {
+            contactJID = evt.Info.Chat.String()
+        }
 
-					// Process S3 upload
-					s3Data, err := GetS3Manager().ProcessMediaForS3(
-						context.Background(),
-						txtid,
-						contactJID,
-						evt.Info.ID,
-						data,
-						video.GetMimetype(),
-						filepath.Base(tmpPath),
-						isIncoming,
-					)
-					if err != nil {
-						log.Error().Err(err).Msg("Failed to upload video to S3")
-					} else {
-						postmap["s3"] = s3Data
-					}
-				}
+        log.Info().Msg("Attempting to upload video to S3")
+        s3Data, err := GetS3Manager().ProcessMediaForS3(
+            context.Background(),
+            txtid,
+            contactJID,
+            evt.Info.ID,
+            data,
+            video.GetMimetype(),
+            filepath.Base(tmpPath),
+            isIncoming,
+        )
+        if err != nil {
+            log.Error().Err(err).Msg("Failed to upload video to S3")
+        } else {
+            postmap["s3"] = s3Data
+            log.Info().Msg("Video uploaded to S3 successfully")
+        }
+    }
 
-				// Convert the video to base64 if needed
-				if s3Config.MediaDelivery == "base64" || s3Config.MediaDelivery == "both" {
-					base64String, mimeType, err := fileToBase64(tmpPath)
-					if err != nil {
-						log.Error().Err(err).Msg("Failed to convert video to base64")
-						return
-					}
+    // Convert the video to base64 if needed
+    if s3Config.MediaDelivery == "base64" || s3Config.MediaDelivery == "both" {
+        log.Info().Str("tmpPath", tmpPath).Msg("Attempting to convert video to base64")
+        base64String, mimeType, err := fileToBase64(tmpPath)
+        if err != nil {
+            log.Error().Err(err).Str("tmpPath", tmpPath).Msg("Failed to convert video to base64")
+            return
+        }
 
-					// Add the base64 string and other details to the postmap
-					postmap["base64"] = base64String
-					postmap["mimeType"] = mimeType
-					postmap["fileName"] = filepath.Base(tmpPath)
-				}
+        postmap["base64"] = base64String
+        postmap["mimeType"] = mimeType
+        postmap["fileName"] = filepath.Base(tmpPath)
+        log.Info().Str("mimeType", mimeType).Msg("Video converted to base64 successfully")
+    }
 
-				// Log the successful conversion
-				log.Info().Str("path", tmpPath).Msg("Video processed")
+    // Log the successful conversion
+    log.Info().Str("path", tmpPath).Msg("Video processed")
 
-				// Delete the temporary file
-				err = os.Remove(tmpPath)
-				if err != nil {
-					log.Error().Err(err).Msg("Failed to delete temporary file")
-				} else {
-					log.Info().Str("path", tmpPath).Msg("Temporary file deleted")
-				}
-			}
-		}
-
+    // Delete the temporary file
+    err = os.Remove(tmpPath)
+    if err != nil {
+        log.Error().Err(err).Str("tmpPath", tmpPath).Msg("Failed to delete temporary file")
+    } else {
+        log.Info().Str("path", tmpPath).Msg("Temporary file deleted")
+    }
+}
+}
 	case *events.Receipt:
 		postmap["type"] = "ReadReceipt"
 		dowebhook = 1
