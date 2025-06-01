@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -89,7 +90,6 @@ func (s *server) connectOnStartup() {
 						subscribedEvents = append(subscribedEvents, arg)
 					}
 				}
-
 			}
 			eventstring := strings.Join(subscribedEvents, ",")
 			log.Info().Str("events", eventstring).Str("jid", jid).Msg("Attempt to connect")
@@ -250,89 +250,165 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 	}
 	clientManager.SetHTTPClient(userID, httpClient)
 
-	if client.Store.ID == nil {
-		// No ID stored, new login
-		qrChan, err := client.GetQRChannel(context.Background())
-		if err != nil {
-			// This error means that we're already logged in, so ignore it.
-			if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
-				log.Error().Err(err).Msg("Failed to get QR channel")
-				return
-			}
-		} else {
-			err = client.Connect() // Si no conectamos no se puede generar QR
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to connect client")
-				return
-			}
+	// Função para conectar ou reconectar o cliente com retentativas rápidas
+	connectClient := func() error {
+		const maxRetries = 5
+		const retryDelay = 2 * time.Second
 
-			myuserinfo, found := userinfocache.Get(token)
-
-			for evt := range qrChan {
-				if evt.Event == "code" {
-					// Display QR code in terminal (useful for testing/developing)
-					if *logType != "json" {
-						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-						fmt.Println("QR code:\n", evt.Code)
-					}
-					// Store encoded/embeded base64 QR on database for retrieval with the /qr endpoint
-					image, _ := qrcode.Encode(evt.Code, qrcode.Medium, 256)
-					base64qrcode := "data:image/png;base64," + base64.StdEncoding.EncodeToString(image)
-					sqlStmt := `UPDATE users SET qrcode=$1 WHERE id=$2`
-					_, err := s.db.Exec(sqlStmt, base64qrcode, userID)
-					if err != nil {
-						log.Error().Err(err).Msg(sqlStmt)
-					} else {
-						if found {
-							v := updateUserInfo(myuserinfo, "Qrcode", base64qrcode)
-							userinfocache.Set(token, v, cache.NoExpiration)
-							log.Info().Str("qrcode", base64qrcode).Msg("update cache userinfo with qr code")
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			if client.Store.ID == nil {
+				// No ID stored, new login
+				qrChan, err := client.GetQRChannel(context.Background())
+				if err != nil {
+					// This error means that we're already logged in, so ignore it.
+					if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
+						log.Error().Err(err).Int("attempt", attempt).Msg("Failed to get QR channel")
+						if attempt == maxRetries {
+							return err
 						}
-					}
-				} else if evt.Event == "timeout" {
-					// Clear QR code from DB on timeout
-					sqlStmt := `UPDATE users SET qrcode='' WHERE id=$1`
-					_, err := s.db.Exec(sqlStmt, userID)
-					if err != nil {
-						log.Error().Err(err).Msg(sqlStmt)
-					} else {
-						if found {
-							v := updateUserInfo(myuserinfo, "Qrcode", "")
-							userinfocache.Set(token, v, cache.NoExpiration)
-						}
-					}
-					log.Warn().Msg("QR timeout killing channel")
-					clientManager.DeleteWhatsmeowClient(userID)
-					clientManager.DeleteMyClient(userID)
-					clientManager.DeleteHTTPClient(userID)
-					killchannel[userID] <- true
-				} else if evt.Event == "success" {
-					log.Info().Msg("QR pairing ok!")
-					// Clear QR code after pairing
-					sqlStmt := `UPDATE users SET qrcode='', connected=1 WHERE id=$1`
-					_, err := s.db.Exec(sqlStmt, userID)
-					if err != nil {
-						log.Error().Err(err).Msg(sqlStmt)
-					} else {
-						if found {
-							v := updateUserInfo(myuserinfo, "Qrcode", "")
-							userinfocache.Set(token, v, cache.NoExpiration)
-						}
+						time.Sleep(retryDelay)
+						continue
 					}
 				} else {
-					log.Info().Str("event", evt.Event).Msg("Login event")
+					err = client.Connect()
+					if err != nil {
+						log.Error().Err(err).Int("attempt", attempt).Msg("Failed to connect client")
+						if attempt == maxRetries {
+							return err
+						}
+						time.Sleep(retryDelay)
+						continue
+					}
+
+					myuserinfo, found := userinfocache.Get(token)
+
+					for evt := range qrChan {
+						if evt.Event == "code" {
+							// Display QR code in terminal (useful for testing/developing)
+							if *logType != "json" {
+								qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+								fmt.Println("QR code:\n", evt.Code)
+							}
+							// Store encoded/embedded base64 QR on database for retrieval with the /qr endpoint
+							image, _ := qrcode.Encode(evt.Code, qrcode.Medium, 256)
+							base64qrcode := "data:image/png;base64," + base64.StdEncoding.EncodeToString(image)
+							sqlStmt := `UPDATE users SET qrcode=$1 WHERE id=$2`
+							_, err := s.db.Exec(sqlStmt, base64qrcode, userID)
+							if err != nil {
+								log.Error().Err(err).Msg(sqlStmt)
+							} else {
+								if found {
+									v := updateUserInfo(myuserinfo, "Qrcode", base64qrcode)
+									userinfocache.Set(token, v, cache.NoExpiration)
+									log.Info().Str("qrcode", base64qrcode).Msg("update cache userinfo with qr code")
+								}
+							}
+						} else if evt.Event == "timeout" {
+							// Clear QR code from DB on timeout
+							sqlStmt := `UPDATE users SET qrcode='' WHERE id=$1`
+							_, err := s.db.Exec(sqlStmt, userID)
+							if err != nil {
+								log.Error().Err(err).Msg(sqlStmt)
+							} else {
+								if found {
+									v := updateUserInfo(myuserinfo, "Qrcode", "")
+									userinfocache.Set(token, v, cache.NoExpiration)
+								}
+							}
+							log.Warn().Msg("QR timeout killing channel")
+							clientManager.DeleteWhatsmeowClient(userID)
+							clientManager.DeleteMyClient(userID)
+							clientManager.DeleteHTTPClient(userID)
+							killchannel[userID] <- true
+							return fmt.Errorf("QR timeout")
+						} else if evt.Event == "success" {
+							log.Info().Msg("QR pairing ok!")
+							// Clear QR code after pairing
+							sqlStmt := `UPDATE users SET qrcode='', connected=1 WHERE id=$1`
+							_, err := s.db.Exec(sqlStmt, userID)
+							if err != nil {
+								log.Error().Err(err).Msg(sqlStmt)
+							} else {
+								if found {
+									v := updateUserInfo(myuserinfo, "Qrcode", "")
+									userinfocache.Set(token, v, cache.NoExpiration)
+								}
+							}
+						} else {
+							log.Info().Str("event", evt.Event).Msg("Login event")
+						}
+					}
+				}
+			} else {
+				// Already logged in, just connect
+				log.Info().Msg("Already logged in, just connect")
+				err = client.Connect()
+				if err != nil {
+					log.Error().Err(err).Int("attempt", attempt).Msg("Failed to connect client")
+					if attempt == maxRetries {
+						return err
+					}
+					time.Sleep(retryDelay)
+					continue
 				}
 			}
+			// Após conexão bem-sucedida, forçar sincronização de estado para garantir PushName
+			err = client.FetchAppState(context.Background(), appstate.WAPatchCriticalBlock, true, true)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to force app state sync after connection")
+			} else {
+				log.Info().Msg("App state sync forced after connection")
+			}
+			return nil
 		}
-
-	} else {
-		// Already logged in, just connect
-		log.Info().Msg("Already logged in, just connect")
-		err = client.Connect()
-		if err != nil {
-			panic(err)
-		}
+		return fmt.Errorf("failed to connect after %d attempts", maxRetries)
 	}
+
+	// Conectar inicialmente
+	if err := connectClient(); err != nil {
+		log.Error().Err(err).Msg("Initial connection failed")
+		return
+	}
+
+	// Iniciar um "keep-alive" para enviar presença a cada 15 segundos
+	go func() {
+		for {
+			select {
+			case <-killchannel[userID]:
+				log.Info().Str("userid", userID).Msg("Stopping keep-alive due to kill signal")
+				return
+			default:
+				if client != nil && client.IsConnected() {
+					// Verificar se o PushName está definido antes de enviar presença
+					if len(client.Store.PushName) == 0 {
+						log.Warn().Msg("PushName not set, attempting to fetch it")
+						// Tentar forçar sincronização para obter o PushName
+						err := client.FetchAppState(context.Background(), appstate.WAPatchCriticalBlock, true, true)
+						if err != nil {
+							log.Warn().Err(err).Msg("Failed to fetch app state to get PushName")
+							time.Sleep(15 * time.Second)
+							continue
+						}
+						// Verificar novamente após sincronização
+						if len(client.Store.PushName) == 0 {
+							log.Warn().Msg("PushName still not set after app state sync, skipping keep-alive")
+							time.Sleep(15 * time.Second)
+							continue
+						}
+					}
+					// PushName está definido, enviar presença
+					log.Debug().Str("pushname", client.Store.PushName).Msg("PushName set, sending keep-alive presence")
+					err := client.SendPresence(types.PresenceAvailable)
+					if err != nil {
+						log.Warn().Err(err).Msg("Failed to send keep-alive presence")
+					} else {
+						log.Debug().Msg("Sent keep-alive presence")
+					}
+				}
+				time.Sleep(15 * time.Second) // Envia presença a cada 15 segundos
+			}
+		}
+	}()
 
 	// Keep connected client live until disconnected/killed
 	for {
@@ -350,8 +426,16 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 			}
 			return
 		default:
-			time.Sleep(1000 * time.Millisecond)
-			//log.Info().Str("jid",textjid).Msg("Loop the loop")
+			// Verificar se o cliente está conectado a cada 1 segundo
+			if client != nil && !client.IsConnected() {
+				log.Warn().Msg("Client disconnected, attempting to reconnect")
+				if err := connectClient(); err != nil {
+					log.Error().Err(err).Msg("Reconnection failed, will retry on next check")
+				} else {
+					log.Info().Msg("Successfully reconnected")
+				}
+			}
+			time.Sleep(1 * time.Second) // Verifica a cada 1 segundo
 		}
 	}
 }
@@ -372,6 +456,34 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	dowebhook := 0
 	path := ""
 
+	// Função auxiliar para reconectar com retentativas rápidas
+	reconnectWithRetries := func() error {
+		const maxRetries = 5
+		const retryDelay = 2 * time.Second
+
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			err := mycli.WAClient.Connect()
+			if err != nil {
+				log.Error().Err(err).Int("attempt", attempt).Msg("Failed to reconnect")
+				if attempt == maxRetries {
+					return err
+				}
+				time.Sleep(retryDelay)
+				continue
+			}
+			// Após reconexão, forçar sincronização de estado para garantir PushName
+			err = mycli.WAClient.FetchAppState(context.Background(), appstate.WAPatchCriticalBlock, true, true)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to force app state sync after reconnection")
+			} else {
+				log.Info().Msg("App state sync forced after reconnection")
+			}
+			log.Info().Int("attempt", attempt).Msg("Successfully reconnected")
+			return nil
+		}
+		return fmt.Errorf("failed to reconnect after %d attempts", maxRetries)
+	}
+
 	switch evt := rawEvt.(type) {
 	case *events.AppStateSyncComplete:
 		if len(mycli.WAClient.Store.PushName) > 0 && evt.Name == appstate.WAPatchCriticalBlock {
@@ -384,10 +496,15 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		}
 	case *events.Connected, *events.PushNameSetting:
 		if len(mycli.WAClient.Store.PushName) == 0 {
-			return
+			log.Warn().Msg("PushName not set on Connected/PushNameSetting event, attempting to fetch")
+			// Forçar sincronização para obter o PushName
+			err := mycli.WAClient.FetchAppState(context.Background(), appstate.WAPatchCriticalBlock, true, true)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to fetch app state to get PushName")
+				return
+			}
 		}
-		// Send presence available when connecting and when the pushname is changed.
-		// This makes sure that outgoing messages always have the right pushname.
+		// Send presence available when connecting and when the pushname is changed
 		err := mycli.WAClient.SendPresence(types.PresenceAvailable)
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to send available presence")
@@ -422,8 +539,22 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		}
 	case *events.StreamReplaced:
 		log.Info().Msg("Received StreamReplaced event")
+		// Tentar reconectar imediatamente com retentativas
+		log.Warn().Msg("Stream replaced, attempting to reconnect")
+		if err := reconnectWithRetries(); err != nil {
+			log.Error().Err(err).Msg("Failed to reconnect after StreamReplaced")
+		}
 		return
 	case *events.Message:
+		// Verificar se o cliente está conectado antes de processar a mensagem
+		if !mycli.WAClient.IsConnected() {
+			log.Warn().Msg("Client not connected, attempting to reconnect before processing message")
+			if err := reconnectWithRetries(); err != nil {
+				log.Error().Err(err).Msg("Failed to reconnect, message processing skipped")
+				return
+			}
+		}
+
 		postmap["type"] = "Message"
 		dowebhook = 1
 		metaParts := []string{fmt.Sprintf("pushname: %s", evt.Info.PushName), fmt.Sprintf("timestamp: %s", evt.Info.Timestamp)}
@@ -436,11 +567,24 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		if evt.IsViewOnce {
 			metaParts = append(metaParts, "view once")
 		}
-		if evt.IsViewOnce {
+		if evt.IsEphemeral {
 			metaParts = append(metaParts, "ephemeral")
 		}
 
 		log.Info().Str("id", evt.Info.ID).Str("source", evt.Info.SourceString()).Str("parts", strings.Join(metaParts, ", ")).Msg("Message Received")
+
+		// Adicionar o nome do grupo ao postmap, se for uma mensagem de grupo
+		if evt.Info.IsGroup {
+			groupInfo, err := mycli.WAClient.GetGroupInfo(evt.Info.Chat)
+			if err != nil {
+				log.Error().Err(err).Str("groupJID", evt.Info.Chat.String()).Msg("Failed to get group info")
+			} else {
+				// Garantir que caracteres especiais como & sejam preservados
+				groupName := groupInfo.GroupName.Name
+				postmap["groupName"] = groupName
+				log.Info().Str("groupName", groupName).Str("groupJID", evt.Info.Chat.String()).Msg("Group info retrieved")
+			}
+		}
 
 		if !*skipMedia {
 			// try to get Image if any
@@ -448,10 +592,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			if img != nil {
 				// Create a temporary directory in /tmp
 				tmpDir := os.Getenv("TMPDIR")
-if tmpDir == "" {
-    tmpDir = "/data/data/com.termux/files/usr/tmp"
-}
-tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
+				if tmpDir == "" {
+					tmpDir = "/data/data/com.termux/files/usr/tmp"
+				}
+				tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
 				errDir := os.MkdirAll(tmpDirectory, 0777)
 				if errDir != nil {
 					log.Error().Err(errDir).Msg("Could not create temporary directory")
@@ -546,10 +690,10 @@ tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
 			if audio != nil {
 				// Create a temporary directory in /tmp
 				tmpDir := os.Getenv("TMPDIR")
-if tmpDir == "" {
-    tmpDir = "/data/data/com.termux/files/usr/tmp"
-}
-tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
+				if tmpDir == "" {
+					tmpDir = "/data/data/com.termux/files/usr/tmp"
+				}
+				tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
 				errDir := os.MkdirAll(tmpDirectory, 0777)
 				if errDir != nil {
 					log.Error().Err(errDir).Msg("Could not create temporary directory")
@@ -650,10 +794,10 @@ tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
 			if document != nil {
 				// Create a temporary directory in /tmp
 				tmpDir := os.Getenv("TMPDIR")
-if tmpDir == "" {
-    tmpDir = "/data/data/com.termux/files/usr/tmp"
-}
-tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
+				if tmpDir == "" {
+					tmpDir = "/data/data/com.termux/files/usr/tmp"
+				}
+				tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
 				errDir := os.MkdirAll(tmpDirectory, 0777)
 				if errDir != nil {
 					log.Error().Err(errDir).Msg("Could not create temporary directory")
@@ -754,130 +898,127 @@ tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
 				}
 			}
 
-		// try to get Video if any
-video := evt.Message.GetVideoMessage()
-if video != nil {
-    // Create a temporary directory in $TMPDIR
-    tmpDir := os.Getenv("TMPDIR")
-    if tmpDir == "" {
-        tmpDir = "/data/data/com.termux/files/usr/tmp"
-    }
-    tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
-    log.Info().Str("tmpDirectory", tmpDirectory).Msg("Attempting to create temporary directory for video")
-    errDir := os.MkdirAll(tmpDirectory, 0777)
-    if errDir != nil {
-        log.Error().Err(errDir).Msg("Could not create temporary directory")
-        return
-    }
+			// try to get Video if any
+			video := evt.Message.GetVideoMessage()
+			if video != nil {
+				// Create a temporary directory in $TMPDIR
+				tmpDir := os.Getenv("TMPDIR")
+				if tmpDir == "" {
+					tmpDir = "/data/data/com.termux/files/usr/tmp"
+				}
+				tmpDirectory := filepath.Join(tmpDir, "user_"+txtid)
+				log.Info().Str("tmpDirectory", tmpDirectory).Msg("Attempting to create temporary directory for video")
+				errDir := os.MkdirAll(tmpDirectory, 0777)
+				if errDir != nil {
+					log.Error().Err(errDir).Msg("Could not create temporary directory")
+					return
+				}
 
-    // Download the video
-    log.Info().Str("mimeType", video.GetMimetype()).Msg("Attempting to download video")
-    data, err := mycli.WAClient.Download(context.Background(), video)
-    if err != nil {
-        log.Error().Err(err).Str("mimeType", video.GetMimetype()).Msg("Failed to download video")
-        return
-    }
-    log.Info().Int("sizeBytes", len(data)).Msg("Video downloaded successfully")
+				// Download the video
+				log.Info().Str("mimeType", video.GetMimetype()).Msg("Attempting to download video")
+				data, err := mycli.WAClient.Download(context.Background(), video)
+				if err != nil {
+					log.Error().Err(err).Str("mimeType", video.GetMimetype()).Msg("Failed to download video")
+					return
+				}
+				log.Info().Int("sizeBytes", len(data)).Msg("Video downloaded successfully")
 
-    // Determine the file extension based on the MIME type
-    exts, _ := mime.ExtensionsByType(video.GetMimetype())
-    var ext string
-    if len(exts) > 0 {
-        ext = exts[0]
-    } else {
-        ext = ".mp4" // Default extension for videos
-        log.Warn().Str("mimeType", video.GetMimetype()).Msg("No extension found for MIME type, using .mp4")
-    }
-    tmpPath := filepath.Join(tmpDirectory, evt.Info.ID+ext)
-    log.Info().Str("tmpPath", tmpPath).Msg("Video file path determined")
+				// Determine the file extension based on the MIME type
+				exts, _ := mime.ExtensionsByType(video.GetMimetype())
+				var ext string
+				if len(exts) > 0 {
+					ext = exts[0]
+				} else {
+					ext = ".mp4" // Default extension for videos
+					log.Warn().Str("mimeType", video.GetMimetype()).Msg("No extension found for MIME type, using .mp4")
+				}
+				tmpPath := filepath.Join(tmpDirectory, evt.Info.ID+ext)
+				log.Info().Str("tmpPath", tmpPath).Msg("Video file path determined")
 
-    // Write the video to the temporary file
-    err = os.WriteFile(tmpPath, data, 0777)
-    if err != nil {
-        log.Error().Err(err).Str("tmpPath", tmpPath).Msg("Failed to save video to temporary file")
-        return
-    }
-    log.Info().Str("tmpPath", tmpPath).Msg("Video saved to temporary file")
+				// Write the video to the temporary file
+				err = os.WriteFile(tmpPath, data, 0777)
+				if err != nil {
+					log.Error().Err(err).Str("tmpPath", tmpPath).Msg("Failed to save video to temporary file")
+					return
+				}
+				log.Info().Str("tmpPath", tmpPath).Msg("Video saved to temporary file")
 
-    // Check if S3 is enabled for this user
-    var s3Config struct {
-        Enabled       bool   `db:"s3_enabled"`
-        MediaDelivery string `db:"media_delivery"`
-    }
-    err = mycli.db.Get(&s3Config, "SELECT s3_enabled, media_delivery FROM users WHERE id = $1", txtid)
-    if err != nil {
-        log.Error().Err(err).Msg("Failed to get S3 config")
-        s3Config.Enabled = false
-        s3Config.MediaDelivery = "base64"
-    }
+				// Check if S3 is enabled for this user
+				var s3Config struct {
+					Enabled       bool   `db:"s3_enabled"`
+					MediaDelivery string `db:"media_delivery"`
+				}
+				err = mycli.db.Get(&s3Config, "SELECT s3_enabled, media_delivery FROM users WHERE id = $1", txtid)
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to get S3 config")
+					s3Config.Enabled = false
+					s3Config.MediaDelivery = "base64"
+				}
 
-    // Process S3 upload if enabled
-    if s3Config.Enabled && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
-        isIncoming := evt.Info.IsFromMe == false
-        contactJID := evt.Info.Sender.String()
-        if evt.Info.IsGroup {
-            contactJID = evt.Info.Chat.String()
-        }
+				// Process S3 upload if enabled
+				if s3Config.Enabled && (s3Config.MediaDelivery == "s3" || s3Config.MediaDelivery == "both") {
+					isIncoming := evt.Info.IsFromMe == false
+					contactJID := evt.Info.Sender.String()
+					if evt.Info.IsGroup {
+						contactJID = evt.Info.Chat.String()
+					}
 
-        log.Info().Msg("Attempting to upload video to S3")
-        s3Data, err := GetS3Manager().ProcessMediaForS3(
-            context.Background(),
-            txtid,
-            contactJID,
-            evt.Info.ID,
-            data,
-            video.GetMimetype(),
-            filepath.Base(tmpPath),
-            isIncoming,
-        )
-        if err != nil {
-            log.Error().Err(err).Msg("Failed to upload video to S3")
-        } else {
-            postmap["s3"] = s3Data
-            log.Info().Msg("Video uploaded to S3 successfully")
-        }
-    }
+					log.Info().Msg("Attempting to upload video to S3")
+					s3Data, err := GetS3Manager().ProcessMediaForS3(
+						context.Background(),
+						txtid,
+						contactJID,
+						evt.Info.ID,
+						data,
+						video.GetMimetype(),
+						filepath.Base(tmpPath),
+						isIncoming,
+					)
+					if err != nil {
+						log.Error().Err(err).Msg("Failed to upload video to S3")
+					} else {
+						postmap["s3"] = s3Data
+						log.Info().Msg("Video uploaded to S3 successfully")
+					}
+				}
 
-    // Convert the video to base64 if needed
-    if s3Config.MediaDelivery == "base64" || s3Config.MediaDelivery == "both" {
-        log.Info().Str("tmpPath", tmpPath).Msg("Attempting to convert video to base64")
-        base64String, mimeType, err := fileToBase64(tmpPath)
-        if err != nil {
-            log.Error().Err(err).Str("tmpPath", tmpPath).Msg("Failed to convert video to base64")
-            return
-        }
+				// Convert the video to base64 if needed
+				if s3Config.MediaDelivery == "base64" || s3Config.MediaDelivery == "both" {
+					log.Info().Str("tmpPath", tmpPath).Msg("Attempting to convert video to base64")
+					base64String, mimeType, err := fileToBase64(tmpPath)
+					if err != nil {
+						log.Error().Err(err).Str("tmpPath", tmpPath).Msg("Failed to convert video to base64")
+						return
+					}
 
-        postmap["base64"] = base64String
-        postmap["mimeType"] = mimeType
-        postmap["fileName"] = filepath.Base(tmpPath)
-        log.Info().Str("mimeType", mimeType).Msg("Video converted to base64 successfully")
-    }
+					postmap["base64"] = base64String
+					postmap["mimeType"] = mimeType
+					postmap["fileName"] = filepath.Base(tmpPath)
+					log.Info().Str("mimeType", mimeType).Msg("Video converted to base64 successfully")
+				}
 
-    // Log the successful conversion
-    log.Info().Str("path", tmpPath).Msg("Video processed")
+				// Log the successful conversion
+				log.Info().Str("path", tmpPath).Msg("Video processed")
 
-    // Delete the temporary file
-    err = os.Remove(tmpPath)
-    if err != nil {
-        log.Error().Err(err).Str("tmpPath", tmpPath).Msg("Failed to delete temporary file")
-    } else {
-        log.Info().Str("path", tmpPath).Msg("Temporary file deleted")
-    }
-}
-}
+				// Delete the temporary file
+				err = os.Remove(tmpPath)
+				if err != nil {
+					log.Error().Err(err).Str("tmpPath", tmpPath).Msg("Failed to delete temporary file")
+				} else {
+					log.Info().Str("path", tmpPath).Msg("Temporary file deleted")
+				}
+			}
+		}
 	case *events.Receipt:
 		postmap["type"] = "ReadReceipt"
 		dowebhook = 1
-		//if evt.Type == events.ReceiptTypeRead || evt.Type == events.ReceiptTypeReadSelf {
 		if evt.Type == types.ReceiptTypeRead || evt.Type == types.ReceiptTypeReadSelf {
 			log.Info().Strs("id", evt.MessageIDs).Str("source", evt.SourceString()).Str("timestamp", fmt.Sprintf("%v", evt.Timestamp)).Msg("Message was read")
-			//if evt.Type == events.ReceiptTypeRead {
 			if evt.Type == types.ReceiptTypeRead {
 				postmap["state"] = "Read"
 			} else {
 				postmap["state"] = "ReadSelf"
 			}
-			//} else if evt.Type == events.ReceiptTypeDelivered {
 		} else if evt.Type == types.ReceiptTypeDelivered {
 			postmap["state"] = "Delivered"
 			log.Info().Str("id", evt.MessageIDs[0]).Str("source", evt.SourceString()).Str("timestamp", fmt.Sprintf("%v", evt.Timestamp)).Msg("Message delivered")
@@ -906,13 +1047,18 @@ if video != nil {
 		log.Info().Str("index", fmt.Sprintf("%+v", evt.Index)).Str("actionValue", fmt.Sprintf("%+v", evt.SyncActionValue)).Msg("App state event received")
 	case *events.LoggedOut:
 		log.Info().Str("reason", evt.Reason.String()).Msg("Logged out")
-		killchannel[mycli.userID] <- true
-		sqlStmt := `UPDATE users SET connected=0 WHERE id=$1`
-		_, err := mycli.db.Exec(sqlStmt, mycli.userID)
-		if err != nil {
-			log.Error().Err(err).Msg(sqlStmt)
-			return
+		// Tentar reconectar imediatamente com retentativas
+		log.Warn().Msg("Client logged out, attempting to reconnect")
+		if err := reconnectWithRetries(); err != nil {
+			log.Error().Err(err).Msg("Failed to reconnect after logout")
+		} else {
+			sqlStmt := `UPDATE users SET connected=1 WHERE id=$1`
+			_, err := mycli.db.Exec(sqlStmt, mycli.userID)
+			if err != nil {
+				log.Error().Err(err).Msg(sqlStmt)
+			}
 		}
+		return
 	case *events.ChatPresence:
 		postmap["type"] = "ChatPresence"
 		dowebhook = 1
@@ -942,13 +1088,13 @@ if video != nil {
 		}
 
 		// Get updated events from cache/database
-		currentEvents := ""
+		var currentEvents string
+		var err error
 		userinfo2, found2 := userinfocache.Get(mycli.token)
 		if found2 {
 			currentEvents = userinfo2.(Values).Get("Events")
 		} else {
 			// If not in cache, get from database
-			var err error
 			err = mycli.db.Get(&currentEvents, "SELECT events FROM users WHERE id=$1", mycli.userID)
 			if err != nil {
 				log.Warn().Err(err).Msg("Could not get events from DB")
@@ -989,11 +1135,19 @@ if video != nil {
 			return
 		}
 
-		// Prepare webhook data
-		jsonData, err := json.Marshal(postmap)
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to marshal postmap to JSON")
-			return
+		// Prepare webhook data com serialização personalizada para evitar escapamento
+		var jsonData []byte
+		{
+			var buf bytes.Buffer
+			enc := json.NewEncoder(&buf)
+			enc.SetEscapeHTML(false) // Desativa o escapamento de HTML para preservar o &
+			if err := enc.Encode(postmap); err != nil {
+				log.Error().Err(err).Msg("Failed to marshal postmap to JSON")
+				return
+			}
+			jsonData = buf.Bytes()
+			// Remove trailing newline adicionado pelo json.Encoder
+			jsonData = bytes.TrimRight(jsonData, "\n")
 		}
 
 		data := map[string]string{
